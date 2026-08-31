@@ -107,8 +107,33 @@ Rate limit behavior:
 - `internal/bot/search.go` : `/r`, pagination sessions, redaction, callbacks.
 - `internal/bot/admin.go` : `/logs`, `/auth`, `/unauth`, `/unauthall`.
 - `internal/bot/stats.go` : `/server` host stats.
-- `internal/jackett/jackett.go` : Torznab query, indexer scoping, feed parsing, size formatting.
+- `internal/jackett/jackett.go` : Torznab query, feed parsing, size formatting.
+- `internal/jackett/indexer.go` : Indexer/filter registry and search options.
+- `internal/jackett/ptp.go`, `btn.go` : One file per tracker, holding its ID, flags, and quirks.
 - `internal/store/store.go` : SQLite-backed authorizations.
+
+### Adding an indexer
+
+Copy `internal/jackett/ptp.go`. Declare the indexer with its Jackett ID, its `/r` flag, a short
+label for the results header, and the tracker's full name:
+
+```go
+var HDB = registerIndexer(&Indexer{
+	ID:    "hdbits",
+	Flag:  "--hdb",
+	Label: "HDB",
+	Name:  "HDBits",
+})
+```
+
+That is the whole change. Flag parsing, the `/help` list, the results header, and endpoint scoping
+all read the registry, so nothing else needs editing. Two optional extras live in the same file
+when a tracker has its own quirks:
+
+- `SplitTitle` on the indexer, if it appends something to release names the way PTP appends
+  `[1080p / Blu-ray / ...]`. Only that tracker's releases go through it.
+- `registerFilter`, for a flag that only makes sense for this tracker, like `--gp`. Set its
+  `Indexer` field and the flag is rejected unless that indexer was asked for too.
 
 ## Best Practices
 

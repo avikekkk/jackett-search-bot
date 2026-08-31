@@ -28,21 +28,6 @@ const (
 	sessionTTL = time.Hour
 )
 
-// Search flags, usable anywhere in a /r command.
-const (
-	// ptpFlag and btnFlag each restrict results to one tracker. Given
-	// together they mean both, which is also the default.
-	ptpFlag = "--ptp"
-	btnFlag = "--btn"
-	// goldenPopcornFlag limits results to PTP's Golden Popcorn releases, so it
-	// only means anything alongside ptpFlag.
-	goldenPopcornFlag = "--gp"
-)
-
-// errGoldenPopcornNeedsPTP is shown when --gp is used without --ptp. Golden
-// Popcorn is a PassThePopcorn label, so the combination has no meaning.
-const errGoldenPopcornNeedsPTP = "<code>--gp</code> only works with <code>--ptp</code>"
-
 // searchSession keeps one user's result set alive across pagination taps.
 type searchSession struct {
 	results   []*jackett.Release
@@ -139,7 +124,7 @@ func (r *request) handleRelease(ctx context.Context) {
 	}
 
 	log := r.bot.log.With("context", r.context(), "query", query,
-		"indexers", strings.Join(opts.Indexers, ","), "golden_popcorn", opts.GoldenPopcorn)
+		"flags", strings.Join(opts.Labels(), ","))
 	log.Info("Search requested")
 
 	searchingMsgID, err := r.reply(ctx, "Searching")
@@ -194,36 +179,54 @@ func (r *request) handleRelease(ctx context.Context) {
 }
 
 // parseReleaseArgs splits the query from the flags, which may appear anywhere
-// in the command. It fails when --gp is asked for without --ptp.
+// in the command. Flags come from the indexer registry, so a new tracker needs
+// no change here. A filter flag fails unless its own indexer was asked for too.
 func parseReleaseArgs(args []string) (string, jackett.Options, error) {
 	var opts jackett.Options
-	var ptp, btn bool
-
 	var terms []string
+
 	for _, arg := range args {
-		switch {
-		case strings.EqualFold(arg, ptpFlag):
-			ptp = true
-		case strings.EqualFold(arg, btnFlag):
-			btn = true
-		case strings.EqualFold(arg, goldenPopcornFlag):
-			opts.GoldenPopcorn = true
-		default:
-			terms = append(terms, arg)
+		if indexer, ok := jackett.IndexerByFlag(arg); ok {
+			if !containsIndexer(opts.Indexers, indexer) {
+				opts.Indexers = append(opts.Indexers, indexer)
+			}
+			continue
+		}
+		if filter, ok := jackett.FilterByFlag(arg); ok {
+			if !containsFilter(opts.Filters, filter) {
+				opts.Filters = append(opts.Filters, filter)
+			}
+			continue
+		}
+		terms = append(terms, arg)
+	}
+
+	for _, filter := range opts.Filters {
+		if !containsIndexer(opts.Indexers, filter.Indexer) {
+			return "", jackett.Options{}, fmt.Errorf(
+				"%s only works with %s", codeBlock(filter.Flag), codeBlock(filter.Indexer.Flag))
 		}
 	}
 
-	if opts.GoldenPopcorn && !ptp {
-		return "", jackett.Options{}, errors.New(errGoldenPopcornNeedsPTP)
-	}
-	if ptp {
-		opts.Indexers = append(opts.Indexers, jackett.IndexerPTP)
-	}
-	if btn {
-		opts.Indexers = append(opts.Indexers, jackett.IndexerBTN)
-	}
-
 	return strings.TrimSpace(strings.Join(terms, " ")), opts, nil
+}
+
+func containsIndexer(list []*jackett.Indexer, want *jackett.Indexer) bool {
+	for _, indexer := range list {
+		if indexer == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFilter(list []*jackett.Filter, want *jackett.Filter) bool {
+	for _, filter := range list {
+		if filter == want {
+			return true
+		}
+	}
+	return false
 }
 
 // sortByResolution puts 1080p releases first and 2160p next, since those are
@@ -289,18 +292,7 @@ func (r *request) scheduleRedact(ctx context.Context, msgID int, token string) {
 // searchHeader names the filters a result set was built with, so a page still
 // says what it is once it has scrolled up the chat.
 func searchHeader(opts jackett.Options) string {
-	var labels []string
-	for _, id := range opts.Indexers {
-		switch id {
-		case jackett.IndexerPTP:
-			labels = append(labels, "PTP")
-		case jackett.IndexerBTN:
-			labels = append(labels, "BTN")
-		}
-	}
-	if opts.GoldenPopcorn {
-		labels = append(labels, "GP")
-	}
+	labels := opts.Labels()
 	if len(labels) == 0 {
 		return header("SEARCH RESULTS")
 	}
@@ -344,7 +336,7 @@ func buildSearchPageText(
 	for _, release := range results[start:end] {
 		// Only the release name is monospaced; the tracker's tag block and the
 		// size read as ordinary text on the same line beside it.
-		name, tags := jackett.SplitTitle(release.Title)
+		name, tags := release.SplitTitle()
 		line := codeBlock(name)
 		if tags != "" {
 			line += " " + html.EscapeString(tags)

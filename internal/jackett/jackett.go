@@ -39,6 +39,19 @@ type Release struct {
 	Title     string
 	Size      string
 	SizeBytes int64
+	// Indexer is the tracker the release came from, nil when Jackett reports an
+	// indexer this package does not know about.
+	Indexer *Indexer
+}
+
+// SplitTitle separates a release name from the tag block its tracker appends,
+// delegating to whatever that indexer does. A tracker with no such quirk, or an
+// unknown one, yields the whole title as the name.
+func (r *Release) SplitTitle() (name, tags string) {
+	if r.Indexer == nil || r.Indexer.SplitTitle == nil {
+		return strings.TrimSpace(r.Title), ""
+	}
+	return r.Indexer.SplitTitle(r.Title)
 }
 
 // Client talks to one Jackett instance.
@@ -62,44 +75,6 @@ var imdbIDRe = regexp.MustCompile(`^tt\d+$`)
 
 // imdbLinkRe pulls the ID out of a pasted IMDb URL.
 var imdbLinkRe = regexp.MustCompile(`imdb\.com/title/(tt\d+)`)
-
-// Indexer IDs Jackett knows this instance's trackers by. They are also the
-// path segment that scopes a torznab call to a single tracker.
-const (
-	IndexerPTP = "passthepopcorn"
-	IndexerBTN = "broadcasthenet"
-)
-
-// Options narrows a search. Indexers lists the Jackett indexer IDs to search;
-// empty means every configured indexer. GoldenPopcorn keeps only PTP's Golden
-// Popcorn releases.
-type Options struct {
-	Indexers      []string
-	GoldenPopcorn bool
-}
-
-// endpointIndexer is the path segment a search runs against. A single requested
-// indexer is queried directly, so the other trackers are never hit; anything
-// else fans out and is filtered from the feed.
-func (o Options) endpointIndexer() string {
-	if len(o.Indexers) == 1 {
-		return o.Indexers[0]
-	}
-	return "all"
-}
-
-// wants reports whether a feed item from indexerID belongs in the results.
-func (o Options) wants(indexerID string) bool {
-	if len(o.Indexers) < 2 {
-		return true
-	}
-	for _, id := range o.Indexers {
-		if id == indexerID {
-			return true
-		}
-	}
-	return false
-}
 
 // SearchURL builds the torznab request for a query. An IMDb ID or link is sent
 // as an imdbid lookup; anything else is a free-text search.
@@ -189,10 +164,7 @@ func ParseFeed(document []byte, opts Options) ([]*Release, error) {
 		if title == "" {
 			continue
 		}
-		if !opts.wants(item.Indexer.ID) {
-			continue
-		}
-		if opts.GoldenPopcorn && !strings.Contains(title, "Golden Popcorn") {
+		if !opts.wantsIndexer(item.Indexer.ID) || !opts.wantsTitle(title) {
 			continue
 		}
 
@@ -201,35 +173,15 @@ func ParseFeed(document []byte, opts Options) ([]*Release, error) {
 			continue
 		}
 
+		indexer, _ := IndexerByID(item.Indexer.ID)
 		releases = append(releases, &Release{
 			Title:     title,
 			Size:      FormatBytes(float64(sizeBytes)),
 			SizeBytes: sizeBytes,
+			Indexer:   indexer,
 		})
 	}
 	return releases, nil
-}
-
-// tagBlockRe matches the slash-separated tag block trackers append to a title,
-// as in "Movie.2003.1080p [1080p / Blu-ray / x264 / MKV / Checked]". The slash
-// is what identifies it, so a bracketed tag that is not a field list is left
-// alone. Brackets do not nest, so the character class keeps the match tight.
-var tagBlockRe = regexp.MustCompile(`\s*\[[^\[\]]*/[^\[\]]*\]`)
-
-// SplitTitle separates a release name from the tag blocks a tracker appends, so
-// the two can be rendered differently. Titles without a tag block, such as
-// BroadcasTheNet's, come back with an empty tags string.
-func SplitTitle(title string) (name, tags string) {
-	blocks := tagBlockRe.FindAllString(title, -1)
-	if len(blocks) == 0 {
-		return strings.TrimSpace(title), ""
-	}
-
-	for i, block := range blocks {
-		blocks[i] = strings.TrimSpace(block)
-	}
-	name = strings.TrimSpace(tagBlockRe.ReplaceAllString(title, ""))
-	return name, strings.Join(blocks, " ")
 }
 
 // FormatBytes renders a byte count the way the result list shows sizes.

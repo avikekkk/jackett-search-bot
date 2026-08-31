@@ -4,6 +4,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"html"
 	"log/slog"
 	"strconv"
@@ -24,27 +25,45 @@ import (
 	"github.com/avisek/jackett-search-bot/internal/store"
 )
 
-const helpText = "<u><b>BOT COMMANDS</b></u>\n\n" +
-	"<b>✦ To search indexers:</b>\n\n" +
-	"<code>/r [query]</code>\n\n" +
-	"The query is free text, an IMDb ID such as <code>tt0133093</code>, or an IMDb link.\n\n" +
-	"<b>✦ Result flags:</b>\n\n" +
-	"Flags are optional and may go anywhere in a <code>/r</code>.\n\n" +
-	"  <code>--ptp</code>   [PassThePopcorn only]\n" +
-	"  <code>--btn</code>   [BroadcasTheNet only]\n" +
-	"  <code>--gp</code>    [Golden Popcorn only, needs <code>--ptp</code>]\n\n" +
-	"Without <code>--ptp</code> or <code>--btn</code>, every indexer is searched.\n\n" +
-	"Results come back 1080p first, then 2160p, smallest first within each.\n\n" +
-	"<b>✦ To page through results:</b>\n\n" +
-	"Use the <code>PREV</code> and <code>NEXT</code> buttons under the message. " +
-	"<code>CLOSE</code> hides the results, and they are redacted automatically after a while.\n\n" +
-	"<b>✦ To view the status:</b>\n\n" +
-	"<code>/server</code>    [system stats]\n\n" +
-	"<b>✦ Admin only:</b>\n\n" +
-	"  <code>/logs</code>            [bot log file]\n" +
-	"  <code>/auth [id]</code>       [authorize a user or chat]\n" +
-	"  <code>/unauth [id]</code>     [remove authorization]\n" +
-	"  <code>/unauthall</code>       [remove every runtime authorization]"
+// helpText is built once at startup so the flag list follows the indexer
+// registry: adding a tracker file adds its line here with no edit.
+var helpText = buildHelpText()
+
+func buildHelpText() string {
+	var flags strings.Builder
+	for _, indexer := range jackett.Indexers() {
+		flags.WriteString(fmt.Sprintf("  <code>%s</code>   [%s only]\n", indexer.Flag, indexer.Name))
+	}
+	for _, filter := range jackett.Filters() {
+		flags.WriteString(fmt.Sprintf("  <code>%s</code>    [%s, needs <code>%s</code>]\n",
+			filter.Flag, filter.Help, filter.Indexer.Flag))
+	}
+
+	var indexerFlags []string
+	for _, indexer := range jackett.Indexers() {
+		indexerFlags = append(indexerFlags, "<code>"+indexer.Flag+"</code>")
+	}
+
+	return "<u><b>BOT COMMANDS</b></u>\n\n" +
+		"<b>✦ To search indexers:</b>\n\n" +
+		"<code>/r [query]</code>\n\n" +
+		"The query is free text, an IMDb ID such as <code>tt0133093</code>, or an IMDb link.\n\n" +
+		"<b>✦ Result flags:</b>\n\n" +
+		"Flags are optional and may go anywhere in a <code>/r</code>.\n\n" +
+		flags.String() + "\n" +
+		"Without " + strings.Join(indexerFlags, " or ") + ", every indexer is searched.\n\n" +
+		"Results come back 1080p first, then 2160p, smallest first within each.\n\n" +
+		"<b>✦ To page through results:</b>\n\n" +
+		"Use the <code>PREV</code> and <code>NEXT</code> buttons under the message. " +
+		"<code>CLOSE</code> hides the results, and they are redacted automatically after a while.\n\n" +
+		"<b>✦ To view the status:</b>\n\n" +
+		"<code>/server</code>    [system stats]\n\n" +
+		"<b>✦ Admin only:</b>\n\n" +
+		"  <code>/logs</code>            [bot log file]\n" +
+		"  <code>/auth [id]</code>       [authorize a user or chat]\n" +
+		"  <code>/unauth [id]</code>     [remove authorization]\n" +
+		"  <code>/unauthall</code>       [remove every runtime authorization]"
+}
 
 // Bot holds everything the update handlers need.
 type Bot struct {
