@@ -1,0 +1,347 @@
+// Package bot implements the Telegram front end: command routing,
+// authorization, and the paginated release list.
+package bot
+
+import (
+	"context"
+	"html"
+	"log/slog"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/message"
+	tdhtml "github.com/gotd/td/telegram/message/html"
+	"github.com/gotd/td/telegram/message/unpack"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+
+	"github.com/avisek/jackett-search-bot/internal/config"
+	"github.com/avisek/jackett-search-bot/internal/jackett"
+	"github.com/avisek/jackett-search-bot/internal/store"
+)
+
+const helpText = "<u><b>BOT COMMANDS</b></u>\n\n" +
+	"<b>✦ To search indexers:</b>\n\n" +
+	"<code>/r [query]</code>\n\n" +
+	"The query is free text, an IMDb ID such as <code>tt0133093</code>, or an IMDb link.\n\n" +
+	"<b>✦ Result flags:</b>\n\n" +
+	"Flags are optional and may go anywhere in a <code>/r</code>.\n\n" +
+	"  <code>--ptp</code>   [PassThePopcorn only]\n" +
+	"  <code>--btn</code>   [BroadcasTheNet only]\n" +
+	"  <code>--gp</code>    [Golden Popcorn only, needs <code>--ptp</code>]\n\n" +
+	"Without <code>--ptp</code> or <code>--btn</code>, every indexer is searched.\n\n" +
+	"Results come back 1080p first, then 2160p, smallest first within each.\n\n" +
+	"<b>✦ To page through results:</b>\n\n" +
+	"Use the <code>PREV</code> and <code>NEXT</code> buttons under the message. " +
+	"<code>CLOSE</code> hides the results, and they are redacted automatically after a while.\n\n" +
+	"<b>✦ To view the status:</b>\n\n" +
+	"<code>/server</code>    [system stats]\n\n" +
+	"<b>✦ Admin only:</b>\n\n" +
+	"  <code>/logs</code>            [bot log file]\n" +
+	"  <code>/auth [id]</code>       [authorize a user or chat]\n" +
+	"  <code>/unauth [id]</code>     [remove authorization]\n" +
+	"  <code>/unauthall</code>       [remove every runtime authorization]"
+
+// Bot holds everything the update handlers need.
+type Bot struct {
+	cfg     *config.Bot
+	log     *slog.Logger
+	sender  *message.Sender
+	api     *tg.Client
+	jackett *jackett.Client
+
+	// runCtx outlives a single update, so a slow search is not cancelled when
+	// update processing returns.
+	runCtx context.Context
+
+	sessions  *sessionStore
+	auth      *store.Store
+	startedAt time.Time
+	wg        sync.WaitGroup
+}
+
+// Run connects to Telegram as a bot and serves updates until ctx is cancelled.
+func Run(ctx context.Context, cfg *config.Bot, logger *slog.Logger) error {
+	auth, err := store.Open(cfg.DatabasePath)
+	if err != nil {
+		return err
+	}
+	defer auth.Close()
+	logger.Info("Authorizations stored in " + cfg.DatabasePath)
+
+	dispatcher := tg.NewUpdateDispatcher()
+	b := &Bot{
+		cfg:       cfg,
+		log:       logger,
+		jackett:   jackett.New(cfg.JackettURL, cfg.JackettAPIKey),
+		sessions:  newSessionStore(maxSearchSessions),
+		auth:      auth,
+		startedAt: time.Now(),
+	}
+
+	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+		return b.onMessage(e, u)
+	})
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		return b.onMessage(e, u)
+	})
+	dispatcher.OnBotCallbackQuery(func(ctx context.Context, e tg.Entities, u *tg.UpdateBotCallbackQuery) error {
+		return b.onCallbackQuery(e, u)
+	})
+
+	client := telegram.NewClient(cfg.TelegramAPIID, cfg.TelegramAPIHash, telegram.Options{
+		UpdateHandler: dispatcher,
+		// Bots re-authenticate from their token on every start, so an
+		// in-memory session is enough and leaves no session file behind.
+		SessionStorage: &session.StorageMemory{},
+	})
+
+	return client.Run(ctx, func(ctx context.Context) error {
+		status, err := client.Auth().Status(ctx)
+		if err != nil {
+			return err
+		}
+		if !status.Authorized {
+			if _, err := client.Auth().Bot(ctx, cfg.TelegramBotToken); err != nil {
+				return err
+			}
+		}
+
+		b.runCtx = ctx
+		b.api = tg.NewClient(client)
+		b.sender = message.NewSender(b.api)
+
+		self, err := client.Self(ctx)
+		if err != nil {
+			return err
+		}
+		logger.Info("Bot started", "username", self.Username, "user_id", self.ID)
+
+		<-ctx.Done()
+		// Give in-flight commands a moment to report their final state.
+		b.wg.Wait()
+		return ctx.Err()
+	})
+}
+
+// goHandle runs a command handler off the update loop so a slow search does not
+// block further updates.
+func (b *Bot) goHandle(name string, fn func(ctx context.Context)) {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				b.log.Error("Handler panicked", "handler", name, "panic", r)
+			}
+		}()
+		fn(b.runCtx)
+	}()
+}
+
+// messageUpdate is satisfied by both private/basic-group and channel updates.
+type messageUpdate interface {
+	message.AnswerableMessageUpdate
+}
+
+func (b *Bot) onMessage(e tg.Entities, u messageUpdate) error {
+	msg, ok := u.GetMessage().(*tg.Message)
+	if !ok || msg.Out {
+		return nil
+	}
+
+	command, args, payload, ok := parseCommand(msg.Message)
+	if !ok {
+		return nil
+	}
+
+	req := &request{bot: b, entities: e, update: u, msg: msg, args: args, payload: payload}
+
+	switch command {
+	case "start", "help":
+		b.goHandle(command, req.handleHelp)
+	case "r":
+		b.goHandle("r", req.handleRelease)
+	case "logs":
+		b.goHandle("logs", req.handleLogs)
+	case "auth":
+		b.goHandle("auth", req.handleAuth)
+	case "unauth":
+		b.goHandle("unauth", req.handleUnauth)
+	case "unauthall":
+		b.goHandle("unauthall", req.handleUnauthAll)
+	case "server":
+		b.goHandle("server", req.handleServer)
+	}
+	return nil
+}
+
+// parseCommand splits "/cmd@bot arg1 arg2" into its parts.
+func parseCommand(text string) (command string, args []string, payload string, ok bool) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") {
+		return "", nil, "", false
+	}
+
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return "", nil, "", false
+	}
+
+	command = strings.TrimPrefix(fields[0], "/")
+	if at := strings.Index(command, "@"); at >= 0 {
+		command = command[:at]
+	}
+	command = strings.ToLower(command)
+	if command == "" {
+		return "", nil, "", false
+	}
+
+	args = fields[1:]
+	// Everything after the command word, whatever whitespace separated them.
+	payload = strings.TrimSpace(text[len(fields[0]):])
+	return command, args, payload, true
+}
+
+// request bundles one command invocation with the plumbing needed to answer it.
+type request struct {
+	bot      *Bot
+	entities tg.Entities
+	update   messageUpdate
+	msg      *tg.Message
+	args     []string
+	payload  string
+}
+
+func (r *request) userID() int64 {
+	if from, ok := r.msg.FromID.(*tg.PeerUser); ok {
+		return from.UserID
+	}
+	// In private chats the sender is implied by the peer.
+	if peer, ok := r.msg.PeerID.(*tg.PeerUser); ok {
+		return peer.UserID
+	}
+	return 0
+}
+
+// chatID is rendered in the Bot API numbering scheme so AUTHORIZED_CHAT_IDS
+// values copied from other bots keep working.
+func (r *request) chatID() int64 {
+	switch peer := r.msg.PeerID.(type) {
+	case *tg.PeerUser:
+		return peer.UserID
+	case *tg.PeerChat:
+		return -peer.ChatID
+	case *tg.PeerChannel:
+		return -1000000000000 - peer.ChannelID
+	}
+	return 0
+}
+
+func (r *request) context() string {
+	return "chat_id=" + itoa(r.chatID()) + " user_id=" + itoa(r.userID())
+}
+
+func (r *request) isOwner() bool { return r.userID() == r.bot.cfg.OwnerID }
+
+// isAuthorizedSearchChat allows the static .env allowlist plus anything granted
+// at runtime with /auth, by either chat or user ID.
+func (r *request) isAuthorizedSearchChat() bool {
+	if r.bot.cfg.IsAuthorizedChat(r.chatID()) {
+		return true
+	}
+	authorized, err := r.bot.auth.IsAuthorized(r.chatID(), r.userID())
+	if err != nil {
+		r.bot.log.Error("Failed to check authorization", "error", err)
+		return false
+	}
+	return authorized
+}
+
+// rejectNonOwner answers and reports true when the sender is not the owner.
+func (r *request) rejectNonOwner(ctx context.Context) bool {
+	if r.isOwner() {
+		return false
+	}
+	r.bot.log.Warn("Unauthorized command rejected", "context", r.context())
+	if _, err := r.reply(ctx, "<code>Unauthorized</code>"); err != nil {
+		r.bot.log.Warn("Failed to send rejection", "error", err)
+	}
+	return true
+}
+
+// rejectUnauthorizedSearch allows the owner plus any authorized chat or user.
+func (r *request) rejectUnauthorizedSearch(ctx context.Context) bool {
+	if r.isOwner() || r.isAuthorizedSearchChat() {
+		return false
+	}
+	r.bot.log.Warn("Unauthorized search command rejected", "context", r.context())
+	if _, err := r.reply(ctx, "<code>Unauthorized</code>"); err != nil {
+		r.bot.log.Warn("Failed to send rejection", "error", err)
+	}
+	return true
+}
+
+// reply posts an HTML reply and returns the new message ID.
+func (r *request) reply(ctx context.Context, text string) (int, error) {
+	return unpack.MessageID(
+		r.bot.sender.Answer(r.entities, r.update).
+			NoWebpage().
+			ReplyMsg(r.msg).
+			StyledText(ctx, tdhtml.String(nil, text)),
+	)
+}
+
+// edit replaces the text of a message this command previously sent.
+func (r *request) edit(ctx context.Context, msgID int, text string, markup tg.ReplyMarkupClass) error {
+	builder := r.bot.sender.Answer(r.entities, r.update).NoWebpage()
+	if markup != nil {
+		builder = builder.Markup(markup)
+	}
+	_, err := builder.Edit(msgID).StyledText(ctx, tdhtml.String(nil, text))
+	return err
+}
+
+// replyLogged sends a reply, logging rather than propagating a send failure.
+func (r *request) replyLogged(ctx context.Context, text string) {
+	if _, err := r.reply(ctx, text); err != nil {
+		r.bot.log.Warn("Failed to send reply", "error", err)
+	}
+}
+
+// editLogged edits a message, treating a no-op edit as success.
+func (r *request) editLogged(ctx context.Context, msgID int, text string) {
+	if err := r.edit(ctx, msgID, text, nil); err != nil && !isNotModified(err) {
+		r.bot.log.Warn("Failed to edit message", "error", err)
+	}
+}
+
+func (r *request) handleHelp(ctx context.Context) {
+	// Authorized users get the command list too; only admin actions are gated.
+	if r.rejectUnauthorizedSearch(ctx) {
+		return
+	}
+	if _, err := r.reply(ctx, helpText); err != nil {
+		r.bot.log.Warn("Failed to send help", "error", err)
+	}
+}
+
+// Error statuses shown to users.
+const errUnexpected = "Unexpected error"
+
+func header(text string) string { return "<u><b>" + text + "</b></u>" }
+
+func codeBlock(text string) string {
+	return "<code>" + html.EscapeString(text) + "</code>"
+}
+
+// isNotModified reports the benign error Telegram returns for a no-op edit.
+func isNotModified(err error) bool {
+	return tgerr.Is(err, "MESSAGE_NOT_MODIFIED")
+}
+
+func itoa(v int64) string { return strconv.FormatInt(v, 10) }

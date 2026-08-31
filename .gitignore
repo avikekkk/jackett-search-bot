@@ -45,3 +45,11 @@ logs/
 # Local runtime database
 auth.db
 auth_test.db
+
+# Go build output.
+/bin/
+/jackettbot
+
+# Local runtime database.
+*.db
+*.db-journal
