@@ -1,6 +1,9 @@
 package jackett
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Indexer is one tracker configured in Jackett, described in one place so a new
 // one is a single small file: see ptp.go for the shape to copy.
@@ -14,6 +17,10 @@ type Indexer struct {
 	Label string
 	// Name is the tracker's full name, shown in /help.
 	Name string
+	// Order sorts the tracker in /help. Without it the listing would follow
+	// Go's file initialization order, which is alphabetical by file name and so
+	// changes as trackers are added.
+	Order int
 	// SplitTitle separates a release name from whatever the tracker appends to
 	// it, so the two can be rendered differently. Trackers that publish plain
 	// release names leave it nil.
@@ -55,11 +62,22 @@ func registerFilter(filter *Filter) *Filter {
 	return filter
 }
 
-// Indexers returns every registered indexer, in registration order.
-func Indexers() []*Indexer { return append([]*Indexer(nil), indexers...) }
+// Indexers returns every registered indexer, in listing order.
+func Indexers() []*Indexer {
+	sorted := append([]*Indexer(nil), indexers...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Order < sorted[j].Order })
+	return sorted
+}
 
-// Filters returns every registered filter, in registration order.
-func Filters() []*Filter { return append([]*Filter(nil), filters...) }
+// Filters returns every registered filter, ordered by the indexer each belongs
+// to, so a tracker's flags stay together under it.
+func Filters() []*Filter {
+	sorted := append([]*Filter(nil), filters...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Indexer.Order < sorted[j].Indexer.Order
+	})
+	return sorted
+}
 
 // IndexerByFlag resolves a command flag to its indexer, ignoring case.
 func IndexerByFlag(flag string) (*Indexer, bool) {

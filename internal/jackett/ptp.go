@@ -12,6 +12,7 @@ var PTP = registerIndexer(&Indexer{
 	Flag:  "--ptp",
 	Label: "PTP",
 	Name:  "PassThePopcorn",
+	Order: 1,
 	// PTP appends a tag block to every title, as in
 	// "Movie.2003.1080p [1080p / Blu-ray / x264 / MKV / Checked]".
 	SplitTitle: splitTagBlock,

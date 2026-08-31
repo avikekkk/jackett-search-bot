@@ -115,7 +115,7 @@ Rate limit behavior:
 ### Adding an indexer
 
 Copy `internal/jackett/ptp.go`. Declare the indexer with its Jackett ID, its `/r` flag, a short
-label for the results header, and the tracker's full name:
+label for the results header, the tracker's full name, and where it sits in the `/help` list:
 
 ```go
 var HDB = registerIndexer(&Indexer{
@@ -123,6 +123,7 @@ var HDB = registerIndexer(&Indexer{
 	Flag:  "--hdb",
 	Label: "HDB",
 	Name:  "HDBits",
+	Order: 3,
 })
 ```
 

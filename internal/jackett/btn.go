@@ -7,4 +7,5 @@ var BTN = registerIndexer(&Indexer{
 	Flag:  "--btn",
 	Label: "BTN",
 	Name:  "BroadcasTheNet",
+	Order: 2,
 })
