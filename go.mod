@@ -6,7 +6,6 @@ require (
 	github.com/gotd/td v0.161.0
 	github.com/joho/godotenv v1.5.1
 	github.com/shirou/gopsutil/v4 v4.26.7
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	modernc.org/sqlite v1.57.0
 )
 

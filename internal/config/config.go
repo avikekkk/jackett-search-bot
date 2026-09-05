@@ -119,7 +119,7 @@ func parseJackettURL(value string) (string, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", configErrorf("JACKETT_URL must be an absolute URL, such as http://localhost:9117")
 	}
-	return strings.TrimRight(value, "/"), nil
+	return parsed.Scheme + "://" + parsed.Host, nil
 }
 
 // Load reads .env plus the process environment and returns a validated config.

@@ -5,8 +5,10 @@ package jackett
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -17,7 +19,17 @@ import (
 
 // searchTimeout bounds one torznab call. Jackett fans a query out to every
 // indexer, so this is generous compared with a normal HTTP call.
-const searchTimeout = 15 * time.Second
+const searchTimeout = 45 * time.Second
+
+// isTimeout reports whether a request failed for taking too long rather than
+// for Jackett being down, which deserve different explanations.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
 
 // maxBodyBytes caps how much of a feed is read, so a misbehaving indexer cannot
 // exhaust memory.
@@ -114,6 +126,9 @@ func (c *Client) Search(ctx context.Context, query string, opts Options) ([]*Rel
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if isTimeout(err) {
+			return nil, errorf("Jackett timed out")
 		}
 		return nil, errorf("Jackett unreachable")
 	}
