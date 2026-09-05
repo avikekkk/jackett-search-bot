@@ -142,6 +142,8 @@ func (r *request) handleRelease(ctx context.Context) {
 			return
 		}
 		if ctx.Err() != nil {
+			log.Warn("Search interrupted by shutdown")
+			r.editLogged(ctx, searchingMsgID, errInterrupted)
 			return
 		}
 		log.Error("Unhandled search failure", "error", err)
@@ -389,7 +391,9 @@ func (b *Bot) onCallbackQuery(e tg.Entities, u *tg.UpdateBotCallbackQuery) error
 
 // callbackSession resolves the session behind a tap and reports whether the
 // tapper may act on it. The owner can drive anyone's results; everybody else is
-// limited to their own, in the chat the search was run in.
+// limited to their own, in the chat the search was run in. A search run by an
+// anonymous group admin has no user ID to match, so anyone in that chat may
+// drive it: otherwise the requester could never page or close their own results.
 func (b *Bot) callbackSession(
 	ctx context.Context,
 	u *tg.UpdateBotCallbackQuery,
@@ -400,7 +404,7 @@ func (b *Bot) callbackSession(
 		b.answerCallback(ctx, u.QueryID, "Session expired", true)
 		return nil, false
 	}
-	if u.UserID != session.userID && u.UserID != b.cfg.OwnerID {
+	if session.userID != 0 && u.UserID != session.userID && u.UserID != b.cfg.OwnerID {
 		b.answerCallback(ctx, u.QueryID, denied, true)
 		return nil, false
 	}
@@ -478,6 +482,8 @@ func (b *Bot) editCallbackMessage(
 		return err
 	}
 
+	ctx, cancel := b.reporting(ctx)
+	defer cancel()
 	builder := b.sender.To(inputPeer).NoWebpage()
 	if replyMarkup != nil {
 		builder = builder.Markup(replyMarkup)
@@ -487,6 +493,8 @@ func (b *Bot) editCallbackMessage(
 }
 
 func (b *Bot) answerCallback(ctx context.Context, queryID int64, text string, alert bool) {
+	ctx, cancel := b.reporting(ctx)
+	defer cancel()
 	req := &tg.MessagesSetBotCallbackAnswerRequest{QueryID: queryID}
 	if text != "" {
 		req.SetMessage(text)

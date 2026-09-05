@@ -105,7 +105,16 @@ func (r *request) repliedUserID(ctx context.Context) int64 {
 		if !ok {
 			continue
 		}
+		// Replying to one of the bot's own messages is not a way of naming
+		// the bot as the target; it just happens to be the message at hand.
+		// The explicit ID, if any, applies instead.
+		if msg.Out {
+			return 0
+		}
 		if from, ok := msg.FromID.(*tg.PeerUser); ok {
+			if from.UserID == r.bot.selfID {
+				return 0
+			}
 			return from.UserID
 		}
 		// A message in a private chat carries no FromID.
